@@ -131,8 +131,13 @@ def find_named_hdu(hdul, extname):
     for hdu in hdul:
         if hdu.data is None or getattr(hdu.data, "ndim", 0) != 2:
             continue
-        if str(hdu.header.get("EXTNAME", "")).strip().upper() == extname:
+
+        extname_value = str(hdu.header.get("EXTNAME", "")).strip().upper()
+        exttype_value = str(hdu.header.get("EXTTYPE", "")).strip().upper()
+
+        if extname_value == extname or exttype_value == extname:
             return hdu.data
+
     return None
 
 
