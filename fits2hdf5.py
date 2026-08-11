@@ -284,14 +284,13 @@ def load_visit(visit, ccd, n_frames, sort_by_time=True):
         # If no variance map exists, store NaN 
         if variance is None:
             variance = np.full_like(image, np.nan, dtype=float)
-            print(f"No VARIANCE HDU.")
-
+            print(f"No VARIANCE HDU.")   
+            
         if mask_raw is None:
-            mask = np.zeros_like(image, dtype=np.uint8)
-
+            mask = np.zeros_like(image, dtype=np.uint16)
         else:
-            mask = (mask_raw != 0).astype(np.uint8)
-
+            mask = mask_raw.astype(np.uint16)
+            
         psf_path = find_psf_file_from_dbimages(image_id, ccd)
         if psf_path is None:
             sys.exit(f"No PSF found for image_id {image_id}")
@@ -469,7 +468,7 @@ def write_shard(out_path, d, tmpl, centers, half_size, run_attrs,
                                   chunks=chunk4, compression=compression)
         ds_var = f.create_dataset("variance", (M, T, H, W), dtype=np.float32,
                                   chunks=chunk4, compression=compression)
-        ds_msk = f.create_dataset("mask", (M, T, H, W), dtype=np.uint8,
+        ds_msk = f.create_dataset("mask", (M, T, H, W), dtype=np.uint16,
                                   chunks=chunk4, compression=compression)
         ds_ctr = f.create_dataset("cutout_center", (M, 2), dtype=np.float32)
         ds_org = f.create_dataset("ref_pixel_origin", (M, 2), dtype=np.float32)
@@ -482,11 +481,9 @@ def write_shard(out_path, d, tmpl, centers, half_size, run_attrs,
                             for img in d["images"]])
             var = np.stack([cutout(v, x_ref, y_ref, half_size)
                             for v in d["variances"]])
-            msk = np.stack([cutout(mk.astype(float), x_ref, y_ref, half_size)
-                            for mk in d["masks"]]).astype(np.uint8)
+            msk = np.stack([cutout(mk, x_ref, y_ref, half_size)
+                            for mk in d["masks"]]).astype(np.uint16)
 
-            var = var.copy()
-            var[msk != 0] = np.inf
 
 
 
