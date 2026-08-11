@@ -1,8 +1,8 @@
-
 """
 pytorch_hdf5_loader.py 
 
 reads image sequences from multiple HDF5 shards and converts each sample into tensors. For every sample, it can generate a new synthetic TNO in memory using the stored observational metadata, then constructs three input channels per frame: science image, inverse-variance weight map, and valid-pixel mask.
+
 """
 
 
@@ -13,11 +13,51 @@ import multiprocessing as mp
 import numpy as np
 from pathlib import Path
 
-import h5py
 import torch
 from torch.utils import data
 
-from tno_injection import inject_cutout_sequence
+from ptsemseg.loader.tno_injection import inject_cutout_sequence
+
+
+CLASSY_BAD_BITS = (
+    (1 << 0)   # BAD
+    | (1 << 1) # SAT
+    | (1 << 2) # INTRP
+    | (1 << 3) # CR
+    | (1 << 4) # EDGE
+    | (1 << 7) # SUSPECT
+    | (1 << 8) # NO_DATA
+    | (1 << 9) # BRIGHT_OBJECT
+    | (1 << 10) # CLIPPED
+    | (1 << 14) # SENSOR_EDGE
+    | (1 << 15) # UNMASKEDNAN
+)
+
+
+def derive_classy_valid_mask(science, variance, mask):
+    """Return binary network-validity mask from raw uint16 CLASSY bits."""
+    mask_bits = np.asarray(mask, dtype=np.uint16)
+    sci = np.asarray(science)
+    var = np.asarray(variance)
+    bad = (mask_bits & CLASSY_BAD_BITS) != 0
+
+    return (
+        ~bad
+        & np.isfinite(sci)
+        & np.isfinite(var)
+        & (var > 0)
+    )
+
+
+def _require_h5py():
+    try:
+        import h5py
+    except ModuleNotFoundError as exc:
+        raise ModuleNotFoundError(
+            "ShardDataset requires h5py. Install project dependencies with "
+            "`python -m pip install -e .`."
+        ) from exc
+    return h5py
 
 
 """
@@ -27,6 +67,7 @@ Define a dataset that reads samples distributed across the shards
 class ShardDataset(data.Dataset):
     # locate shard and read the coutns
     def __init__(self, data_dir, base_seed=0, inject=True, num_implants=1, output_mode="normal"):
+        h5py = _require_h5py()
         self.shard_paths = sorted(Path(data_dir).glob("*.h5"))
         if not self.shard_paths:
             raise FileNotFoundError(f"No HDF5 shards found ")
@@ -94,6 +135,7 @@ class ShardDataset(data.Dataset):
         # look for an already open hanfle
         f = self._handles.get(shard_idx)
         if f is None:
+            h5py = _require_h5py()
             f = h5py.File(self.shard_paths[shard_idx], "r")
             self._handles[shard_idx] = f
         return f
@@ -109,12 +151,12 @@ class ShardDataset(data.Dataset):
                 "exptime": f["frame/exptime"][:],
                 "gain": f["frame/gain"][:],
                 "pixel_scale": f["frame/pixel_scale"][:],
-                "psf_stamp": f["frame/psf_stamp"][:],
+                "psf_file": f["frame/psf_file"][:],
                 "tmpl_cent_time": f["template/cent_time"][:],
                 "tmpl_zp": f["template/zp"][:],
                 "tmpl_exptime": f["template/exptime"][:],
                 "tmpl_pixel_scale": f["template/pixel_scale"][:],
-                "tmpl_psf_stamp": f["template/psf_stamp"][:],
+                "tmpl_psf_file": f["template/psf_file"][:],
             }
             self._meta[shard_idx] = meta
         return meta
@@ -169,13 +211,14 @@ class ShardDataset(data.Dataset):
             # raw background only, no fake object
             labels = {"num_implants": np.int64(0)}
 
-        # valid pixels DEBUGG
-        valid = (msk == 0).astype(np.float32)
+        # HDF5 mask is the raw CLASSY uint16 bitfield. The model receives a
+        # derived binary validity channel; DETECTED bits remain usable pixels.
+        valid_bool = derive_classy_valid_mask(sci, var, msk)
+        valid = valid_bool.astype(np.float32)
         weight = np.zeros_like(var, dtype=np.float32)
-        good = (valid > 0) & np.isfinite(var) & (var > 0)
-        weight[good] = 1.0 / var[good]
+        weight[valid_bool] = 1.0 / var[valid_bool]
 
-        med = np.median(weight[good]) if np.any(good) else 1.0
+        med = np.median(weight[valid_bool]) if np.any(valid_bool) else 1.0
         if med > 0:
             weight /= med
 
