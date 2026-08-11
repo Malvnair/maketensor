@@ -74,7 +74,7 @@ def read_seeing_fwhm(header):
 
 
 def wcs_header_string(wcs_obj):
-    return wcs_obj.to_header().tostring()
+    return wcs_obj.to_header((relax=True).tostring()
 
 
 def build_wcs(header):
