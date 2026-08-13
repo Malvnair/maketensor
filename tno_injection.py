@@ -263,6 +263,51 @@ def make_psf_image(mpsf, shape, x, y, counts):
 
 
 ##############
+# Visible-position sampling
+# reject frame-0 positions whose propagated track leaves any science frame
+########
+
+MAX_POSITION_TRIES = 100
+MAX_ORBIT_TRIES = 20
+
+
+def sample_visible_reference_position(rng, motion, affines, cent_times,
+                                      cent_time0, pscales, H, W,
+                                      pad_x, pad_y):
+    """
+    Pick a crop position so the TNO track stays inside
+    the cutout in every science frame. 
+    """
+    T = len(cent_times)
+
+    for _ in range(MAX_POSITION_TRIES):
+        # candidate frame-0 position, away from the edges
+        u_ref = rng.uniform(pad_x, W - pad_x)
+        v_ref = rng.uniform(pad_y, H - pad_y)
+
+        ok = True
+        for i in range(T):
+            # same affine + motion propagation as the injection loop
+            a = affines[i]
+            x_i = a[0, 0] * u_ref + a[0, 1] * v_ref + a[0, 2]
+            y_i = a[1, 0] * u_ref + a[1, 1] * v_ref + a[1, 2]
+
+            dt_hr = (cent_times[i] - cent_time0) * 24.0
+            x_inj = x_i + motion["rate_ra"] * dt_hr / pscales[i]
+            y_inj = y_i - motion["rate_dec"] * dt_hr / pscales[i]
+
+            # must sit safely inside every frame
+            if not (pad_x <= x_inj < W - pad_x and pad_y <= y_inj < H - pad_y):
+                ok = False
+                break
+
+        if ok:
+            return float(u_ref), float(v_ref)
+
+    return None
+
+
+##############
 # inject_cutout_sequence
 # The one public entry point: plant fake TNOs into a cutout sequence.
 ########
@@ -345,16 +390,26 @@ def inject_cutout_sequence(science, variance, mask, metadata, rng,
 
     for k in range(num_implants):
 
-        # fake orbital paramters
-        orbit = orbit_sampler.sample()
-        # paramters to apparent sky motion
-        motion = MotionModel.compute(orbit)
+        # resample orbit+position until the whole track fits in every frame
+        for _ in range(MAX_ORBIT_TRIES):
+            # fake orbital paramters
+            orbit = orbit_sampler.sample()
+            # paramters to apparent sky motion
+            motion = MotionModel.compute(orbit)
+
+            ref = sample_visible_reference_position(
+                rng, motion, affines, cent_times, cent_time0,
+                pscales, H, W, pad_x, pad_y)
+            if ref is not None:
+                break
+        else:
+            raise RuntimeError(
+                "Could not find an implant position visible in every frame")
+
+        u_ref, v_ref = ref
+
         # random magnitude
         mag = mag_sampler.sample()
-
-        # random frame-0 position in crop coordinates, away from the edges
-        u_ref = rng.uniform(pad_x, W - pad_x)
-        v_ref = rng.uniform(pad_y, H - pad_y)
 
         # template line PSFs only depend on this implant's motion,
         # build them once instead of once per frame
