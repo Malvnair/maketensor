@@ -7,8 +7,8 @@ import subprocess
 from pathlib import Path
 
 
-SRC = Path("/arc/home/$USER$/shards_raw")
-DEST = Path("/scratch/$USER$/shards_raw")
+SRC = Path("/arc/home/{USER}/shards_raw")
+DEST = Path("/scratch/{USER}/shards_raw")
 
 
 def main():
