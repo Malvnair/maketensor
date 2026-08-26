@@ -7,6 +7,10 @@ Reads the original FITS files from shared ARC storage once and converts the real
 creates raw, unimplanted HDF5 cutouts from the original FITS files
 """
 
+import os
+# /arc is a networked filesystem; HDF5's file locking fails there ("unable to
+# lock file, errno 11"). Disable it before h5py loads. Must precede import h5py.
+os.environ.setdefault("HDF5_USE_FILE_LOCKING", "FALSE")
 import sys
 import argparse
 import warnings
@@ -16,8 +20,28 @@ from astropy.io import fits
 from astropy.wcs import WCS
 import h5py
 
+# this runs as a standalone subprocess, so silence astropy's SIP-keyword warnings
+# here too (the notebook's warning filter does not reach a child process)
+warnings.filterwarnings("ignore")
 
-from trippy import psf as trippy_psf
+# TriPPy renders the PSF stamps here and the trailed injections at training time.
+# Prefer an installed copy; fall back to a source checkout in a home directory.
+# Set TRIPPY_PATH to override.
+try:
+    import trippy_compat  # installs the imp shim on py>=3.12
+except Exception:
+    trippy_compat = None
+try:
+    from trippy import psf as trippy_psf
+except ImportError:
+    for _p in (os.environ.get("TRIPPY_PATH"),
+               "/arc/home/malvnair/trippy"):
+        if _p and os.path.isdir(_p) and _p not in sys.path:
+            sys.path.append(_p)
+    from trippy import psf as trippy_psf
+# make TriPPy run on modern Python/NumPy: None trail fields, numpy-2 planting
+if trippy_compat is not None:
+    trippy_compat.patch_trippy(trippy_psf)
 
 
 ####################
@@ -74,7 +98,7 @@ def read_seeing_fwhm(header):
 
 
 def wcs_header_string(wcs_obj):
-    return wcs_obj.to_header(relax=True).tostring()
+    return wcs_obj.to_header().tostring()
 
 
 def build_wcs(header):
@@ -128,16 +152,17 @@ def find_image_hdu(hdul):
 
 
 def find_named_hdu(hdul, extname):
+    # CLASSY warps label the image planes by EXTTYPE (IMAGE / MASK / VARIANCE),
+    # not EXTNAME, so match either. Matching EXTNAME alone silently misses the
+    # variance and mask planes and leaves variance as NaN.
+    extname = extname.strip().upper()
     for hdu in hdul:
         if hdu.data is None or getattr(hdu.data, "ndim", 0) != 2:
             continue
-
-        extname_value = str(hdu.header.get("EXTNAME", "")).strip().upper()
-        exttype_value = str(hdu.header.get("EXTTYPE", "")).strip().upper()
-
-        if extname_value == extname or exttype_value == extname:
+        header = hdu.header
+        if (str(header.get("EXTTYPE", "")).strip().upper() == extname or
+                str(header.get("EXTNAME", "")).strip().upper() == extname):
             return hdu.data
-
     return None
 
 
@@ -207,6 +232,7 @@ def load_visit(visit, ccd, n_frames, sort_by_time=True):
     Load the science DIFFEXP sequence for one visit/CCD into a dict of
     parallel lists.
     """
+    ccd = f"{int(ccd):02d}"          # CCD dirs are zero-padded ("00"), not "0"
     visit_list_path = VISIT_LIST_ROOT / visit / f"{visit}_visit_list.txt"
     if not visit_list_path.exists():
         sys.exit(f"Visit list not found: {visit_list_path}")
@@ -284,13 +310,14 @@ def load_visit(visit, ccd, n_frames, sort_by_time=True):
         # If no variance map exists, store NaN 
         if variance is None:
             variance = np.full_like(image, np.nan, dtype=float)
-            print(f"No VARIANCE HDU.")   
-            
+            print(f"No VARIANCE HDU.")
+
         if mask_raw is None:
-            mask = np.zeros_like(image, dtype=np.uint16)
+            mask = np.zeros_like(image, dtype=np.uint8)
+
         else:
-            mask = mask_raw.astype(np.uint16)
-            
+            mask = (mask_raw != 0).astype(np.uint8)
+
         psf_path = find_psf_file_from_dbimages(image_id, ccd)
         if psf_path is None:
             sys.exit(f"No PSF found for image_id {image_id}")
@@ -330,6 +357,7 @@ def load_templates(visit, ccd):
     """
     Metadata for the subtraction-template images (negative wells).
     """
+    ccd = f"{int(ccd):02d}"          # match load_visit's zero-padded CCD
     path = VISIT_LIST_ROOT / visit / f"{visit}_template_visit_list.txt"
     if not path.exists():
         sys.exit(f"Template visit list not found: {path}")
@@ -468,7 +496,7 @@ def write_shard(out_path, d, tmpl, centers, half_size, run_attrs,
                                   chunks=chunk4, compression=compression)
         ds_var = f.create_dataset("variance", (M, T, H, W), dtype=np.float32,
                                   chunks=chunk4, compression=compression)
-        ds_msk = f.create_dataset("mask", (M, T, H, W), dtype=np.uint16,
+        ds_msk = f.create_dataset("mask", (M, T, H, W), dtype=np.uint8,
                                   chunks=chunk4, compression=compression)
         ds_ctr = f.create_dataset("cutout_center", (M, 2), dtype=np.float32)
         ds_org = f.create_dataset("ref_pixel_origin", (M, 2), dtype=np.float32)
@@ -481,9 +509,11 @@ def write_shard(out_path, d, tmpl, centers, half_size, run_attrs,
                             for img in d["images"]])
             var = np.stack([cutout(v, x_ref, y_ref, half_size)
                             for v in d["variances"]])
-            msk = np.stack([cutout(mk, x_ref, y_ref, half_size)
-                            for mk in d["masks"]]).astype(np.uint16)
+            msk = np.stack([cutout(mk.astype(float), x_ref, y_ref, half_size)
+                            for mk in d["masks"]]).astype(np.uint8)
 
+            var = var.copy()
+            var[msk != 0] = np.inf
 
 
 

@@ -1,37 +1,26 @@
+
 """
 pytorch_hdf5_loader.py 
 
-reads image sequences from multiple HDF5 shards and converts each sample into tensors. 
-For every sample, it can generate a new synthetic TNO in memory using the stored observational metadata, 
-then constructs three input channels per frame: science image, variance plane, and raw CLASSY
-mask bitfield.
-
+reads image sequences from multiple HDF5 shards and converts each sample into tensors. For every sample, it can generate a new synthetic TNO in memory using the stored observational metadata, then constructs three input channels per frame: science image, inverse-variance weight map, and valid-pixel mask.
 """
 
 
 import os
+# /arc is a networked filesystem; HDF5's file locking fails there ("unable to
+# lock file, errno 11"). Disable it before h5py loads. Must precede import h5py.
+os.environ.setdefault("HDF5_USE_FILE_LOCKING", "FALSE")
 import time
 import argparse
 import multiprocessing as mp
 import numpy as np
 from pathlib import Path
 
+import h5py
 import torch
 from torch.utils import data
 
 from tno_injection import inject_cutout_sequence
-
-
-
-def _require_h5py():
-    try:
-        import h5py
-    except ModuleNotFoundError as exc:
-        raise ModuleNotFoundError(
-            "ShardDataset requires h5py. Install project dependencies with "
-            "`python -m pip install -e .`."
-        ) from exc
-    return h5py
 
 
 """
@@ -41,7 +30,6 @@ Define a dataset that reads samples distributed across the shards
 class ShardDataset(data.Dataset):
     # locate shard and read the coutns
     def __init__(self, data_dir, base_seed=0, inject=True, num_implants=1, output_mode="normal"):
-        h5py = _require_h5py()
         self.shard_paths = sorted(Path(data_dir).glob("*.h5"))
         if not self.shard_paths:
             raise FileNotFoundError(f"No HDF5 shards found ")
@@ -109,7 +97,6 @@ class ShardDataset(data.Dataset):
         # look for an already open hanfle
         f = self._handles.get(shard_idx)
         if f is None:
-            h5py = _require_h5py()
             f = h5py.File(self.shard_paths[shard_idx], "r")
             self._handles[shard_idx] = f
         return f
@@ -125,11 +112,15 @@ class ShardDataset(data.Dataset):
                 "exptime": f["frame/exptime"][:],
                 "gain": f["frame/gain"][:],
                 "pixel_scale": f["frame/pixel_scale"][:],
+                "psf_stamp": f["frame/psf_stamp"][:],
+                # psf_file paths are what inject_cutout_sequence actually restores
+                # the trailed PSF from; without them injection raises KeyError.
                 "psf_file": f["frame/psf_file"][:],
                 "tmpl_cent_time": f["template/cent_time"][:],
                 "tmpl_zp": f["template/zp"][:],
                 "tmpl_exptime": f["template/exptime"][:],
                 "tmpl_pixel_scale": f["template/pixel_scale"][:],
+                "tmpl_psf_stamp": f["template/psf_stamp"][:],
                 "tmpl_psf_file": f["template/psf_file"][:],
             }
             self._meta[shard_idx] = meta
@@ -185,37 +176,31 @@ class ShardDataset(data.Dataset):
             # raw background only, no fake object
             labels = {"num_implants": np.int64(0)}
 
-        # Keep the original CLASSY planes with minimal manipulation.
-        # Only sanitize non-finite values so they are safe for PyTorch.
-        sci = np.nan_to_num(
-            sci,
-            nan=0.0,
-            posinf=0.0,
-            neginf=0.0,
-        ).astype(np.float32, copy=False)
+        # valid pixels DEBUGG
+        valid = (msk == 0).astype(np.float32)
+        weight = np.zeros_like(var, dtype=np.float32)
+        good = (valid > 0) & np.isfinite(var) & (var > 0)
+        weight[good] = 1.0 / var[good]
 
-        var = np.nan_to_num(
-            var,
-            nan=0.0,
-            posinf=0.0,
-            neginf=0.0,
-        ).astype(np.float32, copy=False)
+        med = np.median(weight[good]) if np.any(good) else 1.0
+        if med > 0:
+            weight /= med
 
-        # Preserve the raw CLASSY bitmask values.
-        msk = np.asarray(msk, dtype=np.float32)
+        # Difference images carry NaN at masked pixels, and raw ADU values are
+        # large; either feeds the network a NaN loss. Replace non-finite science
+        # with 0 and scale by robust noise so the input is well conditioned.
+        sci = np.nan_to_num(sci, nan=0.0, posinf=0.0, neginf=0.0)
+        noise = float(np.median(np.abs(sci - np.median(sci))) * 1.4826)
+        if noise > 0:
+            sci = sci / noise
 
-        # channel 0 = science
-        # channel 1 = variance
-        # channel 2 = raw CLASSY mask bitfield
-        x = np.stack([sci, var, msk], axis=1)  # (T, 3, H, W)
-
+        # Combine into network input and return as tensor
+        x = np.stack([sci, weight, valid], axis=1)  # (T, 3, H, W)
+        x = np.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
         return {
             "input": torch.from_numpy(x),
             "labels": labels,
         }
-
-
-
 
 
 ####################
@@ -223,7 +208,7 @@ class ShardDataset(data.Dataset):
 ##############
 
 
-# Seb said to test to see hoW quickly they can produce batches
+# benchmark how quickly batches are produced
 def bench_one(dataset, batch_size, num_workers, n_batches):
     dataset.close()
     

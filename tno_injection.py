@@ -16,7 +16,23 @@ trippy_psf = None
 def _import_trippy():
     global trippy_psf
     if trippy_psf is None:
-        from trippy import psf as _tp
+        try:
+            import trippy_compat  # installs the imp shim on py>=3.12
+        except Exception:
+            trippy_compat = None
+        try:
+            from trippy import psf as _tp
+        except ImportError:
+            import os
+            import sys
+            for _p in (os.environ.get("TRIPPY_PATH"),
+                       "/arc/home/malvnair/trippy"):
+                if _p and os.path.isdir(_p) and _p not in sys.path:
+                    sys.path.append(_p)
+            from trippy import psf as _tp
+        # make TriPPy run on modern Python/NumPy: None trail fields, numpy-2 planting
+        if trippy_compat is not None:
+            trippy_compat.patch_trippy(_tp)
         trippy_psf = _tp
 
 
@@ -235,18 +251,24 @@ def make_psf_image(mpsf, shape, x, y, counts):
 
     big_shape = (H + 2 * pad, W + 2 * pad)
 
-    # plant at unit amplitude on the padded blank canvas
-    p_im = mpsf.plant(
-        np.array([x + pad]),
-        np.array([y + pad]),
-        np.array([1.0]),
-        np.zeros(big_shape, dtype=float),
-        useLinePSF=True,
-        returnModel=True,
-        gain=1.0,
-        addNoise=False,
-        verbose=False,
-    )
+    # plant at unit amplitude on the padded blank canvas. A long trailed template
+    # well can exceed this canvas, making TriPPy clip its box non-squarely and
+    # raise a reshape error; such a well is essentially off the cutout, so skip
+    # it (return zeros) instead of crashing the whole training run.
+    try:
+        p_im = mpsf.plant(
+            np.array([x + pad]),
+            np.array([y + pad]),
+            np.array([1.0]),
+            np.zeros(big_shape, dtype=float),
+            useLinePSF=True,
+            returnModel=True,
+            gain=1.0,
+            addNoise=False,
+            verbose=False,
+        )
+    except Exception:
+        return np.zeros(shape, dtype=float)
 
 
     norm_flux = np.sum(p_im)
@@ -260,51 +282,6 @@ def make_psf_image(mpsf, shape, x, y, counts):
 
     # crop back to the training cutout
     return p_im[pad:pad + H, pad:pad + W]
-
-
-##############
-# Visible-position sampling
-# reject frame-0 positions whose propagated track leaves any science frame
-########
-
-MAX_POSITION_TRIES = 100
-MAX_ORBIT_TRIES = 20
-
-
-def sample_visible_reference_position(rng, motion, affines, cent_times,
-                                      cent_time0, pscales, H, W,
-                                      pad_x, pad_y):
-    """
-    Pick a crop position so the TNO track stays inside
-    the cutout in every science frame. 
-    """
-    T = len(cent_times)
-
-    for _ in range(MAX_POSITION_TRIES):
-        # candidate frame-0 position, away from the edges
-        u_ref = rng.uniform(pad_x, W - pad_x)
-        v_ref = rng.uniform(pad_y, H - pad_y)
-
-        ok = True
-        for i in range(T):
-            # same affine + motion propagation as the injection loop
-            a = affines[i]
-            x_i = a[0, 0] * u_ref + a[0, 1] * v_ref + a[0, 2]
-            y_i = a[1, 0] * u_ref + a[1, 1] * v_ref + a[1, 2]
-
-            dt_hr = (cent_times[i] - cent_time0) * 24.0
-            x_inj = x_i + motion["rate_ra"] * dt_hr / pscales[i]
-            y_inj = y_i - motion["rate_dec"] * dt_hr / pscales[i]
-
-            # must sit safely inside every frame
-            if not (pad_x <= x_inj < W - pad_x and pad_y <= y_inj < H - pad_y):
-                ok = False
-                break
-
-        if ok:
-            return float(u_ref), float(v_ref)
-
-    return None
 
 
 ##############
@@ -390,26 +367,16 @@ def inject_cutout_sequence(science, variance, mask, metadata, rng,
 
     for k in range(num_implants):
 
-        # resample orbit+position until the whole track fits in every frame
-        for _ in range(MAX_ORBIT_TRIES):
-            # fake orbital paramters
-            orbit = orbit_sampler.sample()
-            # paramters to apparent sky motion
-            motion = MotionModel.compute(orbit)
-
-            ref = sample_visible_reference_position(
-                rng, motion, affines, cent_times, cent_time0,
-                pscales, H, W, pad_x, pad_y)
-            if ref is not None:
-                break
-        else:
-            raise RuntimeError(
-                "Could not find an implant position visible in every frame")
-
-        u_ref, v_ref = ref
-
+        # fake orbital paramters
+        orbit = orbit_sampler.sample()
+        # paramters to apparent sky motion
+        motion = MotionModel.compute(orbit)
         # random magnitude
         mag = mag_sampler.sample()
+
+        # random frame-0 position in crop coordinates, away from the edges
+        u_ref = rng.uniform(pad_x, W - pad_x)
+        v_ref = rng.uniform(pad_y, H - pad_y)
 
         # template line PSFs only depend on this implant's motion,
         # build them once instead of once per frame
