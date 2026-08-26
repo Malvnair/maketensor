@@ -19,7 +19,7 @@ from pathlib import Path
 import torch
 from torch.utils import data
 
-from ptsemseg.loader.tno_injection import inject_cutout_sequence
+from tno_injection import inject_cutout_sequence
 
 
 
