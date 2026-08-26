@@ -16,7 +16,7 @@ from astropy.io import fits
 from astropy.wcs import WCS
 import h5py
 
-sys.path.append("/arc/home/malvnair/trippy")
+
 from trippy import psf as trippy_psf
 
 
